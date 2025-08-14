@@ -1,84 +1,91 @@
-# train_trocr.py
 import os
-import math
-import torch
-from datasets import load_from_disk
-from transformers import (TrOCRProcessor, VisionEncoderDecoderModel,
-                          Seq2SeqTrainer, Seq2SeqTrainingArguments, default_data_collator)
+import pandas as pd
 from PIL import Image
+from datasets import Dataset
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel, Seq2SeqTrainer, Seq2SeqTrainingArguments
+import torch
 
-BASE_MODEL = 'microsoft/trocr-base-stage1'
-PROJECT_DIR = os.path.join(os.path.dirname(__file__), '..')
-HF_DATASET_DIR = os.path.join(PROJECT_DIR, 'hf_dataset')
-OUTPUT_DIR = os.path.join(PROJECT_DIR, 'trocr_finetuned')
+# ========================
+# 1. Cargar CSVs
+# ========================
+train_df = pd.read_csv("dataset/train_labels.csv")
+val_df = pd.read_csv("dataset/val_labels.csv")
 
-# Cargar dataset preparado
-ds = load_from_disk(HF_DATASET_DIR)
+# Asegurar que las rutas existen
+for path in train_df["image_path"].tolist() + val_df["image_path"].tolist():
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"No se encontró: {path}")
 
-# Cargar processor y modelo
-processor = TrOCRProcessor.from_pretrained(BASE_MODEL)
-model = VisionEncoderDecoderModel.from_pretrained(BASE_MODEL)
+# ========================
+# 2. Cargar modelo y procesador
+# ========================
+model_name = "microsoft/trocr-base-printed"
+processor = TrOCRProcessor.from_pretrained(model_name)
+model = VisionEncoderDecoderModel.from_pretrained(model_name)
 
-# Ajustes del tokenizer/decoder
-model.config.decoder_start_token_id = processor.tokenizer.cls_token_id
-model.config.eos_token_id = processor.tokenizer.sep_token_id
-model.config.pad_token_id = processor.tokenizer.pad_token_id
-model.config.vocab_size = model.config.decoder.vocab_size
+# ========================
+# 3. Función para convertir DataFrame → Dataset
+# ========================
+def df_to_dataset(df):
+    dataset_dict = {
+        "image": [],
+        "text": []
+    }
+    for _, row in df.iterrows():
+        image = Image.open(row["image_path"]).convert("RGB")
+        dataset_dict["image"].append(image)
+        dataset_dict["text"].append(str(row["text"]))
+    return Dataset.from_dict(dataset_dict)
 
-# Preprocess function: transforma imagen -> pixel_values; tokeniza labels
+train_dataset = df_to_dataset(train_df)
+val_dataset = df_to_dataset(val_df)
 
-def preprocess(batch):
-    images = [Image.open(p).convert('RGB') for p in batch['image_path']]
-    pixel_values = processor(images=images, return_tensors='pt').pixel_values
-    # tokenizar textos
-    with processor.as_target_processor():
-        labels = processor(text=batch['text']).input_ids
-    batch['pixel_values'] = list(pixel_values)
-    batch['labels'] = labels
+# ========================
+# 4. Tokenización / Procesamiento
+# ========================
+def preprocess_batch(batch):
+    pixel_values = processor(images=batch["image"], return_tensors="pt").pixel_values
+    labels = processor.tokenizer(batch["text"], padding="max_length", max_length=128, truncation=True).input_ids
+    batch["pixel_values"] = pixel_values
+    batch["labels"] = labels
     return batch
 
-# Mapear (usar batched=False para manejar PIL Image conversion)
-ds_train = ds['train'].map(preprocess)
-ds_val = ds['validation'].map(preprocess)
+train_dataset = train_dataset.map(preprocess_batch, batched=True, batch_size=4)
+val_dataset = val_dataset.map(preprocess_batch, batched=True, batch_size=4)
 
-# data_collator para Seq2SeqTrainer
-
-def collate_fn(features):
-    pixel_values = torch.stack([f['pixel_values'] for f in features])
-    labels = [f['labels'] for f in features]
-    labels = processor.tokenizer.pad({'input_ids': labels}, return_tensors='pt', padding=True)
-    labels_input_ids = labels['input_ids']
-    labels_input_ids[labels_input_ids == processor.tokenizer.pad_token_id] = -100
-    return {'pixel_values': pixel_values, 'labels': labels_input_ids}
-
-# Training args
+# ========================
+# 5. Configurar entrenamiento
+# ========================
 training_args = Seq2SeqTrainingArguments(
-    output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=2,
-    per_device_eval_batch_size=2,
+    output_dir="./trocr_model",
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
     predict_with_generate=True,
-    evaluation_strategy='epoch',
-    save_strategy='epoch',
-    logging_strategy='steps',
-    logging_steps=100,
-    num_train_epochs=5,
-    save_total_limit=2,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    logging_dir="./logs",
+    num_train_epochs=3,
     fp16=torch.cuda.is_available(),
+    learning_rate=5e-5,
+    save_total_limit=2,
+    logging_steps=10
 )
 
 trainer = Seq2SeqTrainer(
     model=model,
+    tokenizer=processor.tokenizer,
     args=training_args,
-    train_dataset=ds_train,
-    eval_dataset=ds_val,
-    data_collator=collate_fn,
-    tokenizer=processor.feature_extractor,  # no es tokenizer real, pero evita errores; usamos processor directamente
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset
 )
 
+# ========================
+# 6. Entrenar
+# ========================
 trainer.train()
 
-# guardar
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-model.save_pretrained(OUTPUT_DIR)
-processor.save_pretrained(OUTPUT_DIR)
-print('Modelo guardado en', OUTPUT_DIR)
+# ========================
+# 7. Guardar modelo final
+# ========================
+model.save_pretrained("./trocr_model_final")
+processor.save_pretrained("./trocr_model_final")
